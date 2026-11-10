@@ -14,6 +14,7 @@
       statusDisconnected: '未接続',
       statusConnected: '接続中',
       btnOpenTab: 'タブで全画面表示',
+      btnOpenSidePanel: 'サイドパネルで開く',
       btnToggleSettings: '設定を開く',
       btnCloseSettings: '設定を閉じる',
 
@@ -154,6 +155,7 @@
       statusDisconnected: 'Disconnected',
       statusConnected: 'Connected',
       btnOpenTab: 'Open in Full Tab',
+      btnOpenSidePanel: 'Open in Side Panel',
       btnToggleSettings: 'Settings',
       btnCloseSettings: 'Close Settings',
 

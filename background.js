@@ -9,7 +9,8 @@ importScripts('i18n.js', 'pfml.js');
 async function configureSidePanel() {
   if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
     try {
-      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+      // この設定はブラウザ側に保持されるため、明示的に無効化しないとポップアップが開かない
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
     } catch (err) {
       console.warn('Failed to configure side panel behavior:', err);
     }

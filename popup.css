@@ -63,6 +63,11 @@
   padding: 0;
 }
 
+html.is-popup body {
+  width: 440px;
+  min-height: auto;
+}
+
 body {
   font-family: var(--font-sans);
   background: var(--bg-app);
@@ -188,6 +193,10 @@ body {
   display: flex;
   align-items: center;
   gap: 4px;
+}
+
+.icon-button[hidden] {
+  display: none;
 }
 
 .icon-button {

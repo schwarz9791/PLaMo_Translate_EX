@@ -9,6 +9,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const connectionDot = document.getElementById('connectionDot');
   const connectionStatus = document.getElementById('connectionStatus');
   const btnOpenTab = document.getElementById('btnOpenTab');
+  const btnOpenSidePanel = document.getElementById('btnOpenSidePanel');
   const btnToggleSettings = document.getElementById('btnToggleSettings');
 
   const btnGrabSelection = document.getElementById('btnGrabSelection');
@@ -159,6 +160,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (btnModeWllama) btnModeWllama.classList.toggle('active', isWllama);
     if (lmStudioSettingsGroup) lmStudioSettingsGroup.style.display = isWllama ? 'none' : 'flex';
     if (wllamaSettingsGroup) wllamaSettingsGroup.style.display = isWllama ? 'flex' : 'none';
+  }
+
+  // ポップアップはフォーカス喪失で閉じるため、入力と訳文を session に退避する
+  function saveDraft() {
+    const draftOutput = outputText.style.display !== 'none' ? outputText.textContent : '';
+    chrome.storage.session.set({ draftInput: inputText.value, draftOutput }).catch(() => {});
   }
 
   function updateCharCount() {
@@ -421,6 +428,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     effectiveTargetBadge.style.display = 'none';
     modelUsedBadge.style.display = 'none';
     btnTranslate.disabled = true;
+    saveDraft();
 
     const sourceLang = sourceLangSelect.value;
     const targetLang = targetLangSelect.value;
@@ -445,6 +453,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (response && response.ok) {
         outputText.textContent = response.translatedText || (currentUiLang === 'en' ? '(Empty translation)' : '（翻訳結果が空です）');
         outputText.style.display = 'block';
+        saveDraft();
 
         // Badges
         const isSwitched = Boolean(response.autoSwitched);
@@ -481,7 +490,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   // -------------------------------------------------------------
 
   // Input Character Count & Auto Shortcut
-  inputText.addEventListener('input', updateCharCount);
+  inputText.addEventListener('input', () => {
+    updateCharCount();
+    saveDraft();
+  });
 
   inputText.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -493,6 +505,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   btnClearInput.addEventListener('click', () => {
     inputText.value = '';
     updateCharCount();
+    saveDraft();
     inputText.focus();
   });
 
@@ -543,6 +556,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     outputText.textContent = '';
     outputText.style.display = 'none';
     outputPlaceholder.style.display = 'block';
+    saveDraft();
     effectiveTargetBadge.style.display = 'none';
     modelUsedBadge.style.display = 'none';
     promptDetails.style.display = 'none';
@@ -552,6 +566,20 @@ document.addEventListener('DOMContentLoaded', async () => {
   btnOpenTab.addEventListener('click', () => {
     chrome.tabs.create({ url: chrome.runtime.getURL('popup.html') });
   });
+
+  const isPopupView = new URLSearchParams(location.search).get('view') === 'popup';
+  document.documentElement.classList.toggle('is-popup', isPopupView);
+  if (isPopupView && chrome.sidePanel?.open) {
+    btnOpenSidePanel.hidden = false;
+    // sidePanel.open はユーザー操作の直後に呼ぶ必要があるため、windowId は事前に取得しておく
+    let windowId;
+    chrome.windows.getCurrent().then((w) => { windowId = w.id; }).catch(() => {});
+    btnOpenSidePanel.addEventListener('click', () => {
+      chrome.sidePanel.open({ windowId })
+        .then(() => window.close())
+        .catch((err) => console.warn('Failed to open side panel:', err));
+    });
+  }
 
   // Grab selection from active tab
   btnGrabSelection.addEventListener('click', async () => {
@@ -782,6 +810,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     refreshWllamaStatus();
   } else {
     checkConnection(true); // Silent connection check on popup open
+  }
+  try {
+    const { draftInput, draftOutput } = await chrome.storage.session.get(['draftInput', 'draftOutput']);
+    if (draftInput) {
+      inputText.value = draftInput;
+      updateCharCount();
+    }
+    if (draftOutput) {
+      outputPlaceholder.style.display = 'none';
+      outputText.textContent = draftOutput;
+      outputText.style.display = 'block';
+    }
+  } catch (err) {
+    console.warn('Failed to restore draft:', err);
   }
   await checkPendingSidebarText();
 });
