@@ -19,6 +19,7 @@
   let isPageTranslationActive = false;
   let isPageTranslationPaused = false;
   let pageTranslationAbortController = null;
+  let pageTranslationUrl = null;
 
   // Initialize Settings
   chrome.storage.local.get(DEFAULT_SETTINGS, (stored) => {
@@ -408,6 +409,8 @@
 
     for (const sel of primarySelectors) {
       const candidates = document.querySelectorAll(sel);
+      // 複数ヒットは一覧ページとみなし、1 件に絞らない
+      if (candidates.length > 1) continue;
       for (const el of candidates) {
         // Ensure container has substantial text (> 120 chars) and is visible
         if (el.innerText && el.innerText.trim().length > 120) {
@@ -424,7 +427,7 @@
 
   function findTranslatableElements() {
     const root = findMainContentRoot();
-    const selector = 'p, h1, h2, h3, h4, h5, h6, li, blockquote, td, figcaption';
+    const selector = 'p, h1, h2, h3, h4, h5, h6, li, blockquote, td, figcaption, [slot="title"]';
     const all = Array.from(root.querySelectorAll(selector));
 
     const targetLang = currentSettings.targetLang || 'ja';
@@ -468,7 +471,7 @@
       '.dialog'
     ].join(', ');
 
-    return all.filter(el => {
+    const kept = all.filter(el => {
       // 1. Ignore elements inside noise containers
       if (el.closest(noiseSelector)) {
         return false;
@@ -520,6 +523,9 @@
 
       return true;
     });
+
+    // ponytail: 末端のみ訳すため <li>親テキスト<ul>…</ul></li> の親側テキストは訳されない。必要なら直下テキストのみ訳す方式へ。
+    return kept.filter(el => !kept.some(o => o !== el && el.contains(o)));
   }
 
   function sortElementsByViewport(elements) {
@@ -539,10 +545,13 @@
 
   function togglePageTranslation() {
     if (isPageTranslationActive) {
-      // Toggle pause / resume
-      isPageTranslationPaused = !isPageTranslationPaused;
-      updatePageBar();
-      return;
+      if (location.href.split('#')[0] === pageTranslationUrl) {
+        // Toggle pause / resume
+        isPageTranslationPaused = !isPageTranslationPaused;
+        updatePageBar();
+        return;
+      }
+      restorePageTranslation();
     }
 
     startPageTranslation();
@@ -557,7 +566,11 @@
 
     isPageTranslationActive = true;
     isPageTranslationPaused = false;
-    pageTranslationAbortController = new AbortController();
+    // アンカー移動は同一ページとして扱う
+    pageTranslationUrl = location.href.split('#')[0];
+    const controller = new AbortController();
+    pageTranslationAbortController = controller;
+    const { signal } = controller;
 
     renderPageBar(elements.length);
 
@@ -565,16 +578,17 @@
     const totalCount = elements.length;
 
     for (let i = 0; i < elements.length; i++) {
-      if (!isPageTranslationActive) break;
+      if (signal.aborted) break;
 
       // Handle pause loop
-      while (isPageTranslationPaused && isPageTranslationActive) {
+      while (isPageTranslationPaused && !signal.aborted) {
         await new Promise(r => setTimeout(r, 400));
       }
 
-      if (!isPageTranslationActive) break;
+      if (signal.aborted) break;
 
       const el = elements[i];
+      if (!el.isConnected) continue;
       const text = el.innerText.trim();
       el.setAttribute('data-plamo-origin', 'true');
 
@@ -586,6 +600,7 @@
         <span class="plamo-ext-inline-badge">PLaMo 訳</span>
         <span class="plamo-ext-inline-content">翻訳中...</span>
       `;
+      if (el.slot) inlineEl.slot = el.slot;
       el.parentNode.insertBefore(inlineEl, el.nextSibling);
 
       try {
@@ -596,7 +611,7 @@
           form: currentSettings.form || 'none'
         });
 
-        if (!isPageTranslationActive) {
+        if (signal.aborted) {
           removeElement(inlineEl);
           break;
         }
@@ -615,7 +630,7 @@
           `;
         }
       } catch (err) {
-        if (!isPageTranslationActive) {
+        if (signal.aborted) {
           removeElement(inlineEl);
           break;
         }
@@ -633,7 +648,8 @@
       await new Promise(r => setTimeout(r, 60));
     }
 
-    if (isPageTranslationActive) {
+    if (!signal.aborted) {
+      isPageTranslationActive = false;
       updatePageBar(completedCount, totalCount, true);
     }
   }
@@ -641,12 +657,13 @@
   function renderPageBar(total) {
     removePageBar();
 
+    const srcLabel = document.body.classList.contains('plamo-ext-hide-original') ? t('btnShowOriginal') : t('btnHideOriginal');
     pageBarEl = document.createElement('div');
     pageBarEl.className = 'plamo-ext-page-bar';
     pageBarEl.innerHTML = `
       <span class="plamo-ext-page-title">🌐 PLaMo</span>
       <span class="plamo-ext-page-progress">${t('pageTranslatingProgress', { current: 0, total })}</span>
-      <button class="plamo-ext-btn-sm plamo-ext-page-toggle-src" title="${t('btnHideOriginal')}">${t('btnHideOriginal')}</button>
+      <button class="plamo-ext-btn-sm plamo-ext-page-toggle-src" title="${srcLabel}">${srcLabel}</button>
       <button class="plamo-ext-btn-sm plamo-ext-page-pause" title="${t('btnPause')}">${t('btnPause')}</button>
       <button class="plamo-ext-btn-sm plamo-ext-page-restore" title="${t('btnRestore')}">${t('btnRestore')}</button>
     `;
