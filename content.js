@@ -491,8 +491,9 @@
         return false;
       }
 
-      // 操作部品や画像リンクを含む要素は置換すると機能やリンクを失うため対象外
-      if (el.querySelector('button, input, select, textarea, video, audio, iframe, canvas, a[href] img, a[href] svg')) {
+      // 操作部品や画像だけのリンクを含む要素は置換すると機能やリンクを失うため対象外
+      if (el.querySelector('button, input, select, textarea, video, audio, iframe, canvas') ||
+        [...el.querySelectorAll('a[href]')].some(a => !(a.innerText || '').trim() && a.querySelector('img, svg'))) {
         return false;
       }
 
@@ -876,7 +877,8 @@
         if (!response.translatedText || !response.translatedText.trim()) {
           failure = '翻訳結果が空です';
         } else if (!el.isConnected || el.textContent !== source) {
-          // 翻訳中に原文が書き換わった訳は古いので挿入せず、再走査で訳し直す
+          // 翻訳中に原文が書き換わった訳は古いので挿入せず、間隔を空けて再走査で訳し直す
+          lastTranslatedAt.set(el, Date.now());
           el.removeAttribute('data-plamo-origin');
           if (el.isConnected) scheduleRescan();
           return true;
@@ -944,12 +946,13 @@
 
     // ponytail: 変化のたびにルート全体を再走査する。重くなれば追加ノードの部分木だけ走査する方式へ。
     // 変化し続けるページでも再走査が止まらないよう間引きで実行する。
-    // 再走査が必要なのは、翻訳済み原文のテキスト変更、外部ノードの追加、翻訳対象や訳文の除去のみ
+    // 再走査が必要なのは、翻訳済み原文の内側の変化、外部ノードの追加、翻訳対象や訳文の除去のみ
     const TRACKED_SELECTOR = '[data-plamo-origin="done"], .plamo-ext-replaced';
     pageMutationObserver = new MutationObserver((records) => {
       const relevant = records.some(r => {
-        if (r.type === 'characterData') return !!r.target.parentElement?.closest('[data-plamo-origin="done"]');
-        if (isOwnNode(r.target)) return false;
+        const target = r.type === 'characterData' ? r.target.parentElement : r.target;
+        if (target?.closest('[data-plamo-origin="done"]')) return true;
+        if (r.type === 'characterData' || isOwnNode(r.target)) return false;
         return [...r.addedNodes].some(n => !isOwnNode(n)) ||
           [...r.removedNodes].some(n => n.nodeType === Node.ELEMENT_NODE && (n.matches(TRACKED_SELECTOR) || n.querySelector(TRACKED_SELECTOR)));
       });
