@@ -26,6 +26,9 @@
   let pageRescanTimer = null;
   let pageDoneCount = 0;
   let pageBarIdleShown = false;
+  let pageBarError = null;
+  // 原文要素 → 挿入済みの訳文。原文が差し替わったら訳文を破棄して再翻訳するために保持する
+  const pageTranslated = new Map(); // el → { shell, source }
 
   // Initialize Settings
   chrome.storage.local.get(DEFAULT_SETTINGS, (stored) => {
@@ -480,7 +483,12 @@
       }
 
       // 3. Ignore if already marked, or if it contains a marked descendant
-      if (el.hasAttribute('data-plamo-origin') || el.querySelector('[data-plamo-origin]')) {
+      if (el.closest('[data-plamo-origin]') || el.querySelector('[data-plamo-origin]')) {
+        return false;
+      }
+
+      // 操作部品を含む要素は置換すると機能を失うため対象外
+      if (el.querySelector('button, input, select, textarea, video, audio, iframe, canvas')) {
         return false;
       }
 
@@ -518,7 +526,7 @@
     });
 
     // ponytail: 末端のみ訳すため <li>親テキスト<ul>…</ul></li> の親側テキストは訳されない。必要なら直下テキストのみ訳す方式へ。
-    return kept.filter(el => !kept.some(o => o !== el && el.contains(o)));
+    return kept.filter((el, i) => !(kept[i + 1] && el.contains(kept[i + 1])));
   }
 
   // -------------------------------------------------------------
@@ -536,19 +544,30 @@
   function extractParts(el) {
     const parts = [];
     const allowLinks = !el.closest('a');
+    const breakLine = () => {
+      const last = parts[parts.length - 1];
+      if (last && last.text !== '\n') parts.push({ text: '\n' });
+    };
     const walk = (node) => {
       for (const child of node.childNodes) {
         if (child.nodeType === Node.TEXT_NODE) {
           parts.push({ text: collapseSpaces(child.nodeValue) });
         } else if (child.nodeType === Node.ELEMENT_NODE) {
-          if (!child.checkVisibility()) continue;
+          // display: contents は checkVisibility() が false になるが中身は表示される
+          const display = getComputedStyle(child).display;
+          if (display !== 'contents' && !child.checkVisibility()) continue;
           if (child.tagName === 'BR') {
             parts.push({ text: '\n' });
-          } else if (allowLinks && child.matches('a[href]') && child.innerText.trim()) {
+            continue;
+          }
+          const isBlock = /^(block|flex|grid|list-item|table|flow-root)/.test(display);
+          if (isBlock) breakLine();
+          if (allowLinks && child instanceof HTMLAnchorElement && child.hasAttribute('href') && child.innerText.trim()) {
             parts.push({ link: child, text: collapseSpaces(child.innerText) });
           } else {
             walk(child);
           }
+          if (isBlock) breakLine();
         }
       }
     };
@@ -634,12 +653,14 @@
     return frag;
   }
 
-  function createShell(el) {
+  function createShell(el, lang) {
     const shell = el.localName.includes('-') ? document.createElement('div') : el.cloneNode(false);
     shell.removeAttribute('id');
     shell.removeAttribute('data-plamo-origin');
     if (el.slot) shell.slot = el.slot;
     shell.classList.add('plamo-ext-replaced');
+    shell.lang = lang;
+    shell.dir = 'auto';
     return shell;
   }
 
@@ -745,9 +766,7 @@
   function togglePageTranslation() {
     if (isPageTranslationActive) {
       if (location.href.split('#')[0] === pageTranslationUrl) {
-        // Toggle pause / resume
-        isPageTranslationPaused = !isPageTranslationPaused;
-        updatePageBar();
+        setPagePaused(!isPageTranslationPaused);
         return;
       }
       restorePageTranslation();
@@ -761,6 +780,27 @@
   function isOwnNode(node) {
     const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
     return !!el && !!el.closest(OWN_UI_SELECTOR);
+  }
+
+  // 再開時は失敗した要素も再試行の対象に戻す
+  function setPagePaused(paused) {
+    isPageTranslationPaused = paused;
+    if (!paused) {
+      pageBarError = null;
+      document.querySelectorAll('[data-plamo-origin="error"]').forEach(el => el.removeAttribute('data-plamo-origin'));
+      watchNewCandidates();
+    }
+    updatePageBar();
+  }
+
+  // 原文が消えた・書き換わった、または訳文が除去された組は破棄し、再走査で再翻訳させる
+  function syncTranslated() {
+    for (const [el, { shell, source }] of pageTranslated) {
+      if (el.isConnected && shell.isConnected && el.textContent === source) continue;
+      pageTranslated.delete(el);
+      shell.remove();
+      if (el.isConnected) el.removeAttribute('data-plamo-origin');
+    }
   }
 
   function watchNewCandidates(candidates = findTranslatableElements()) {
@@ -790,11 +830,15 @@
 
   // 中断された場合は false
   async function translateElement(el, signal) {
-    const { text, parts, links } = buildSource(el);
     el.setAttribute('data-plamo-origin', 'translating');
 
     let failure = null;
+    // 通信・バックエンド障害のときだけ全体を一時停止し、再開時にまとめて再試行させる（要素固有の失敗では止めない）
+    let pauseOnFailure = false;
     try {
+      const source = el.textContent;
+      const { text, parts, links } = buildSource(el);
+      pauseOnFailure = true;
       const response = await chrome.runtime.sendMessage({
         type: 'TRANSLATE_TEXT',
         text,
@@ -804,14 +848,21 @@
 
       if (signal.aborted) return false;
 
-      if (response && response.ok) {
-        const shell = createShell(el);
-        shell.appendChild(buildTranslation(response.translatedText, links));
-        replacedParts.set(shell, parts);
-        el.after(shell);
-        el.setAttribute('data-plamo-origin', 'done');
-      } else {
+      if (!response || !response.ok) {
         failure = response ? response.error : '応答なし';
+      } else {
+        pauseOnFailure = false;
+        if (!response.translatedText || !response.translatedText.trim()) {
+          failure = '翻訳結果が空です';
+        } else {
+          const lang = response.effectiveTargetLang || currentSettings.targetLang || 'ja';
+          const shell = createShell(el, lang === 'ja-easy' ? 'ja' : lang);
+          shell.appendChild(buildTranslation(response.translatedText, links));
+          replacedParts.set(shell, parts);
+          el.after(shell);
+          pageTranslated.set(el, { shell, source });
+          el.setAttribute('data-plamo-origin', 'done');
+        }
       }
     } catch (err) {
       if (signal.aborted) return false;
@@ -821,11 +872,13 @@
     if (failure !== null) {
       el.setAttribute('data-plamo-origin', 'error');
       console.warn('[PLaMo] page translation failed:', failure);
+      if (pauseOnFailure) isPageTranslationPaused = true;
+      showPageBarError(failure);
+    } else {
+      pageDoneCount++;
+      pageBarError = null;
+      updatePageBar();
     }
-
-    pageDoneCount++;
-    updatePageBar();
-    if (failure !== null) showPageBarError(failure);
     return true;
   }
 
@@ -846,6 +899,8 @@
 
     pageDoneCount = 0;
     pageBarIdleShown = false;
+    pageBarError = null;
+    pageTranslated.clear();
     renderPageBar();
 
     pageIntersectionObserver = new IntersectionObserver((entries, observer) => {
@@ -854,17 +909,22 @@
         pageQueue.add(entry.target);
         observer.unobserve(entry.target);
       }
-    }, { rootMargin: '1000px 0px' });
+    }, { rootMargin: '1000px 0px', scrollMargin: '1000px 0px' });
 
     // ponytail: 変化のたびにルート全体を再走査する。重くなれば追加ノードの部分木だけ走査する方式へ。
+    // 変化し続けるページでも再走査が止まらないよう間引きで実行する。
+    // 訳文だけが外部から除去された場合も同期させるため、除去は自前ノードでも拾う
     pageMutationObserver = new MutationObserver((records) => {
-      const relevant = records.some(r => r.addedNodes.length > 0 && !isOwnNode(r.target) &&
-        Array.from(r.addedNodes).some(n => !isOwnNode(n)));
-      if (!relevant) return;
-      clearTimeout(pageRescanTimer);
-      pageRescanTimer = setTimeout(() => watchNewCandidates(), 800);
+      const relevant = records.some(r => !isOwnNode(r.target) &&
+        (r.type === 'characterData' || r.removedNodes.length > 0 || [...r.addedNodes].some(n => !isOwnNode(n))));
+      if (!relevant || pageRescanTimer) return;
+      pageRescanTimer = setTimeout(() => {
+        pageRescanTimer = null;
+        syncTranslated();
+        watchNewCandidates();
+      }, 800);
     });
-    pageMutationObserver.observe(document.body, { childList: true, subtree: true });
+    pageMutationObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
 
     watchNewCandidates(initialCandidates);
 
@@ -875,19 +935,28 @@
       if (signal.aborted) break;
 
       for (const el of pageQueue) {
-        if (!el.isConnected) pageQueue.delete(el);
+        if (!el.isConnected) {
+          pageQueue.delete(el);
+        } else if (!el.checkVisibility()) {
+          // 非表示の間は待機させ、再表示時に IntersectionObserver が再度キューへ戻す
+          pageQueue.delete(el);
+          pageIntersectionObserver.observe(el);
+        }
       }
 
       if (pageQueue.size === 0) {
-        if (!pageBarIdleShown) {
+        await new Promise(r => setTimeout(r, 300));
+        if (pageQueue.size === 0 && !pageBarIdleShown && !signal.aborted) {
           pageBarIdleShown = true;
           updatePageBar();
         }
-        await new Promise(r => setTimeout(r, 300));
         continue;
       }
 
-      pageBarIdleShown = false;
+      if (pageBarIdleShown) {
+        pageBarIdleShown = false;
+        updatePageBar();
+      }
       if (!(await translateElement(takeNearestQueued(), signal))) break;
 
       // Short delay between blocks to avoid overloading LM Studio
@@ -922,8 +991,7 @@
     });
 
     pauseBtn.addEventListener('click', () => {
-      isPageTranslationPaused = !isPageTranslationPaused;
-      updatePageBar();
+      setPagePaused(!isPageTranslationPaused);
     });
 
     restoreBtn.addEventListener('click', () => {
@@ -939,7 +1007,9 @@
     pauseBtn.textContent = isPageTranslationPaused ? t('btnResume') : t('btnPause');
     pauseBtn.title = pauseBtn.textContent;
     const progressEl = pageBarEl.querySelector('.plamo-ext-page-progress');
-    if (isPageTranslationPaused) {
+    if (pageBarError !== null) {
+      progressEl.textContent = t('pageTranslationError', { message: pageBarError });
+    } else if (isPageTranslationPaused) {
       progressEl.textContent = t('pageTranslationPaused');
     } else if (pageBarIdleShown) {
       progressEl.textContent = t('pageTranslationIdle', { total: pageDoneCount });
@@ -949,10 +1019,8 @@
   }
 
   function showPageBarError(message) {
-    const progressEl = pageBarEl && pageBarEl.querySelector('.plamo-ext-page-progress');
-    if (progressEl) progressEl.textContent = t('pageTranslationError', { message });
-    // 待機表示への切り替えでエラー表示を上書きしない
-    pageBarIdleShown = true;
+    pageBarError = message;
+    updatePageBar();
   }
 
   function removePageBar() {
@@ -974,7 +1042,10 @@
     if (pageMutationObserver) pageMutationObserver.disconnect();
     pageMutationObserver = null;
     clearTimeout(pageRescanTimer);
+    pageRescanTimer = null;
     pageQueue.clear();
+    pageTranslated.clear();
+    pageBarError = null;
 
     document.body.classList.remove('plamo-ext-show-original');
     document.querySelectorAll('.plamo-ext-replaced').forEach(removeElement);
