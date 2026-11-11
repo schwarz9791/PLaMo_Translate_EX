@@ -20,6 +20,12 @@
   let isPageTranslationPaused = false;
   let pageTranslationAbortController = null;
   let pageTranslationUrl = null;
+  const pageQueue = new Set();
+  let pageIntersectionObserver = null;
+  let pageMutationObserver = null;
+  let pageRescanTimer = null;
+  let pageDoneCount = 0;
+  let pageBarIdleShown = false;
 
   // Initialize Settings
   chrome.storage.local.get(DEFAULT_SETTINGS, (stored) => {
@@ -342,15 +348,6 @@
     }
   }
 
-  function escapeHtml(str) {
-    return (str || '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
-  }
-
   // -------------------------------------------------------------
   // Mouse & Selection Event Listeners
   // -------------------------------------------------------------
@@ -478,16 +475,12 @@
       }
 
       // 2. Ignore elements inside extension UI
-      if (el.closest('.plamo-ext-popover-card, .plamo-ext-floating-trigger, .plamo-ext-page-bar, .plamo-ext-inline-translation, .plamo-ext-popover-iframe')) {
+      if (el.closest('.plamo-ext-popover-card, .plamo-ext-floating-trigger, .plamo-ext-page-bar, .plamo-ext-popover-iframe, .plamo-ext-replaced, .plamo-ext-tooltip-host')) {
         return false;
       }
 
-      // 3. Ignore if already marked or already has inline translation block
-      if (el.getAttribute('data-plamo-origin') === 'true') {
-        return false;
-      }
-      const next = el.nextElementSibling;
-      if (next && next.classList.contains('plamo-ext-inline-translation')) {
+      // 3. Ignore if already marked, or if it contains a marked descendant
+      if (el.hasAttribute('data-plamo-origin') || el.querySelector('[data-plamo-origin]')) {
         return false;
       }
 
@@ -528,20 +521,226 @@
     return kept.filter(el => !kept.some(o => o !== el && el.contains(o)));
   }
 
-  function sortElementsByViewport(elements) {
-    const vh = window.innerHeight;
-    return elements.sort((a, b) => {
-      const rectA = a.getBoundingClientRect();
-      const rectB = b.getBoundingClientRect();
+  // -------------------------------------------------------------
+  // Whole-Page Translation - Source extraction / Translation assembly
+  // -------------------------------------------------------------
+  const replacedParts = new WeakMap();
 
-      const inViewA = rectA.bottom > 0 && rectA.top < vh;
-      const inViewB = rectB.bottom > 0 && rectB.top < vh;
+  const collapseSpaces = (str) => str.replace(/\s+/g, ' ');
+  const escapeMarkup = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const unescapeMarkup = (str) => str
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+  const stripLinkMarkers = (str) => str.replace(/<a\b[^>]*>/g, '').replace(/<\/a>/g, '');
 
-      if (inViewA && !inViewB) return -1;
-      if (!inViewA && inViewB) return 1;
-      return rectA.top - rectB.top;
-    });
+  // ponytail: リンク以外の装飾は平文化する。必要になったら同じ目印方式で対象を広げる
+  function extractParts(el) {
+    const parts = [];
+    const allowLinks = !el.closest('a');
+    const walk = (node) => {
+      for (const child of node.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          parts.push({ text: collapseSpaces(child.nodeValue) });
+        } else if (child.nodeType === Node.ELEMENT_NODE) {
+          if (!child.checkVisibility()) continue;
+          if (child.tagName === 'BR') {
+            parts.push({ text: '\n' });
+          } else if (allowLinks && child.matches('a[href]') && child.innerText.trim()) {
+            parts.push({ link: child, text: collapseSpaces(child.innerText) });
+          } else {
+            walk(child);
+          }
+        }
+      }
+    };
+    walk(el);
+
+    while (parts.length) {
+      parts[0].text = parts[0].text.trimStart();
+      if (parts[0].text || parts[0].link) break;
+      parts.shift();
+    }
+    while (parts.length) {
+      const last = parts[parts.length - 1];
+      last.text = last.text.trimEnd();
+      if (last.text || last.link) break;
+      parts.pop();
+    }
+    return parts;
   }
+
+  function buildSource(el) {
+    const parts = extractParts(el);
+    const links = parts.filter(p => p.link).map(p => p.link);
+    if (links.length === 0) {
+      return { text: el.innerText.trim(), parts, links };
+    }
+    let n = 0;
+    const text = parts.map(p => p.link
+      ? `<a href="${++n}">${escapeMarkup(p.text)}</a>`
+      : escapeMarkup(p.text)).join('');
+    return { text, parts, links };
+  }
+
+  function partsToFragment(parts) {
+    const frag = document.createDocumentFragment();
+    for (const p of parts) {
+      if (p.link) {
+        const a = p.link.cloneNode(false);
+        a.textContent = p.text;
+        frag.appendChild(a);
+      } else {
+        frag.appendChild(document.createTextNode(p.text));
+      }
+    }
+    return frag;
+  }
+
+  // モデル出力は必ず textContent / テキストノードで挿入する（HTML として解釈しない）
+  function buildTranslation(translated, links) {
+    const frag = document.createDocumentFragment();
+    if (links.length === 0) {
+      frag.appendChild(document.createTextNode(translated));
+      return frag;
+    }
+
+    const re = /<a href="(\d+)">([\s\S]*?)<\/a>/g;
+    const segments = [];
+    const seen = new Set();
+    let last = 0;
+    let ok = true;
+    for (const m of translated.matchAll(re)) {
+      const n = Number(m[1]);
+      if (n < 1 || n > links.length || seen.has(n)) { ok = false; break; }
+      seen.add(n);
+      segments.push({ text: translated.slice(last, m.index) });
+      segments.push({ n, text: m[2] });
+      last = m.index + m[0].length;
+    }
+    if (!ok || seen.size !== links.length) {
+      frag.appendChild(document.createTextNode(unescapeMarkup(stripLinkMarkers(translated))));
+      return frag;
+    }
+    segments.push({ text: translated.slice(last) });
+
+    for (const seg of segments) {
+      if (seg.n) {
+        const a = links[seg.n - 1].cloneNode(false);
+        a.textContent = unescapeMarkup(seg.text);
+        frag.appendChild(a);
+      } else if (seg.text) {
+        frag.appendChild(document.createTextNode(unescapeMarkup(stripLinkMarkers(seg.text))));
+      }
+    }
+    return frag;
+  }
+
+  function createShell(el) {
+    const shell = el.localName.includes('-') ? document.createElement('div') : el.cloneNode(false);
+    shell.removeAttribute('id');
+    shell.removeAttribute('data-plamo-origin');
+    if (el.slot) shell.slot = el.slot;
+    shell.classList.add('plamo-ext-replaced');
+    return shell;
+  }
+
+  // -------------------------------------------------------------
+  // Whole-Page Translation - Hover tooltip (original text)
+  // -------------------------------------------------------------
+  let tooltipHost = null;
+  let tooltipCard = null;
+  let tooltipShowTimer = null;
+  let tooltipHideTimer = null;
+
+  const TOOLTIP_CSS = `
+    :host { all: initial; }
+    .card {
+      position: fixed;
+      top: 0;
+      left: 0;
+      z-index: 2147483647;
+      display: none;
+      box-sizing: border-box;
+      max-width: min(480px, 100vw - 16px);
+      padding: 8px 12px;
+      background: #1e293b;
+      color: #ffffff;
+      font: 13px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Hiragino Sans", "Meiryo", sans-serif;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    }
+    a { color: #93c5fd; text-decoration: underline; }
+  `;
+
+  function ensureTooltip() {
+    if (tooltipHost && tooltipHost.isConnected) return;
+    tooltipHost = document.createElement('div');
+    tooltipHost.className = 'plamo-ext-tooltip-host';
+    const root = tooltipHost.attachShadow({ mode: 'open' });
+    const style = document.createElement('style');
+    style.textContent = TOOLTIP_CSS;
+    tooltipCard = document.createElement('div');
+    tooltipCard.className = 'card';
+    root.append(style, tooltipCard);
+    tooltipHost.addEventListener('mouseenter', () => clearTimeout(tooltipHideTimer));
+    tooltipHost.addEventListener('mouseleave', scheduleTooltipHide);
+    document.documentElement.appendChild(tooltipHost);
+  }
+
+  function hideTooltip() {
+    clearTimeout(tooltipShowTimer);
+    clearTimeout(tooltipHideTimer);
+    if (tooltipCard) tooltipCard.style.display = 'none';
+  }
+
+  function scheduleTooltipHide() {
+    clearTimeout(tooltipShowTimer);
+    clearTimeout(tooltipHideTimer);
+    tooltipHideTimer = setTimeout(hideTooltip, 200);
+  }
+
+  function showTooltip(shell) {
+    const parts = replacedParts.get(shell);
+    if (!parts || !shell.isConnected || document.body.classList.contains('plamo-ext-show-original')) return;
+    ensureTooltip();
+    tooltipCard.replaceChildren(partsToFragment(parts));
+    tooltipCard.style.display = 'block';
+
+    const rect = shell.getBoundingClientRect();
+    const vw = document.documentElement.clientWidth;
+    const vh = document.documentElement.clientHeight;
+    const { width, height } = tooltipCard.getBoundingClientRect();
+    let top = rect.bottom + 6;
+    if (top + height > vh - 8) top = Math.max(8, rect.top - height - 6);
+    const left = Math.max(8, Math.min(rect.left, vw - width - 8));
+    tooltipCard.style.left = `${left}px`;
+    tooltipCard.style.top = `${top}px`;
+  }
+
+  function removeTooltip() {
+    hideTooltip();
+    removeElement(tooltipHost);
+    tooltipHost = null;
+    tooltipCard = null;
+  }
+
+  document.addEventListener('mouseover', (e) => {
+    const shell = e.target instanceof Element ? e.target.closest('.plamo-ext-replaced') : null;
+    if (!shell) return;
+    clearTimeout(tooltipHideTimer);
+    clearTimeout(tooltipShowTimer);
+    tooltipShowTimer = setTimeout(() => showTooltip(shell), 250);
+  });
+
+  document.addEventListener('mouseout', (e) => {
+    const shell = e.target instanceof Element ? e.target.closest('.plamo-ext-replaced') : null;
+    if (!shell) return;
+    if (e.relatedTarget instanceof Node && shell.contains(e.relatedTarget)) return;
+    scheduleTooltipHide();
+  });
+
+  window.addEventListener('scroll', hideTooltip, { capture: true, passive: true });
 
   function togglePageTranslation() {
     if (isPageTranslationActive) {
@@ -557,9 +756,82 @@
     startPageTranslation();
   }
 
+  const OWN_UI_SELECTOR = '.plamo-ext-replaced, .plamo-ext-page-bar, .plamo-ext-tooltip-host, .plamo-ext-popover-card, .plamo-ext-floating-trigger, .plamo-ext-popover-iframe';
+
+  function isOwnNode(node) {
+    const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    return !!el && !!el.closest(OWN_UI_SELECTOR);
+  }
+
+  function watchNewCandidates(candidates = findTranslatableElements()) {
+    for (const el of candidates) {
+      el.setAttribute('data-plamo-origin', 'pending');
+      pageIntersectionObserver.observe(el);
+    }
+  }
+
+  function distanceToViewport(el) {
+    const rect = el.getBoundingClientRect();
+    if (rect.bottom <= 0) return -rect.bottom;
+    if (rect.top >= window.innerHeight) return rect.top - window.innerHeight;
+    return 0;
+  }
+
+  function takeNearestQueued() {
+    let nearest = null;
+    let best = Infinity;
+    for (const el of pageQueue) {
+      const d = distanceToViewport(el);
+      if (d < best) { best = d; nearest = el; }
+    }
+    pageQueue.delete(nearest);
+    return nearest;
+  }
+
+  // 中断された場合は false
+  async function translateElement(el, signal) {
+    const { text, parts, links } = buildSource(el);
+    el.setAttribute('data-plamo-origin', 'translating');
+
+    let failure = null;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: 'TRANSLATE_TEXT',
+        text,
+        targetLang: currentSettings.targetLang || 'ja',
+        form: currentSettings.form || 'none'
+      });
+
+      if (signal.aborted) return false;
+
+      if (response && response.ok) {
+        const shell = createShell(el);
+        shell.appendChild(buildTranslation(response.translatedText, links));
+        replacedParts.set(shell, parts);
+        el.after(shell);
+        el.setAttribute('data-plamo-origin', 'done');
+      } else {
+        failure = response ? response.error : '応答なし';
+      }
+    } catch (err) {
+      if (signal.aborted) return false;
+      failure = err.message || String(err);
+    }
+
+    if (failure !== null) {
+      el.setAttribute('data-plamo-origin', 'error');
+      console.warn('[PLaMo] page translation failed:', failure);
+    }
+
+    pageDoneCount++;
+    updatePageBar();
+    if (failure !== null) showPageBarError(failure);
+    return true;
+  }
+
   async function startPageTranslation() {
-    const elements = sortElementsByViewport(findTranslatableElements());
-    if (elements.length === 0) {
+    const initialCandidates = findTranslatableElements();
+    if (initialCandidates.length === 0) {
       alert('翻訳可能なテキストブロックが見つかりませんでした。');
       return;
     }
@@ -572,97 +844,66 @@
     pageTranslationAbortController = controller;
     const { signal } = controller;
 
-    renderPageBar(elements.length);
+    pageDoneCount = 0;
+    pageBarIdleShown = false;
+    renderPageBar();
 
-    let completedCount = 0;
-    const totalCount = elements.length;
+    pageIntersectionObserver = new IntersectionObserver((entries, observer) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        pageQueue.add(entry.target);
+        observer.unobserve(entry.target);
+      }
+    }, { rootMargin: '1000px 0px' });
 
-    for (let i = 0; i < elements.length; i++) {
-      if (signal.aborted) break;
+    // ponytail: 変化のたびにルート全体を再走査する。重くなれば追加ノードの部分木だけ走査する方式へ。
+    pageMutationObserver = new MutationObserver((records) => {
+      const relevant = records.some(r => r.addedNodes.length > 0 && !isOwnNode(r.target) &&
+        Array.from(r.addedNodes).some(n => !isOwnNode(n)));
+      if (!relevant) return;
+      clearTimeout(pageRescanTimer);
+      pageRescanTimer = setTimeout(() => watchNewCandidates(), 800);
+    });
+    pageMutationObserver.observe(document.body, { childList: true, subtree: true });
 
-      // Handle pause loop
+    watchNewCandidates(initialCandidates);
+
+    while (!signal.aborted) {
       while (isPageTranslationPaused && !signal.aborted) {
         await new Promise(r => setTimeout(r, 400));
       }
-
       if (signal.aborted) break;
 
-      const el = elements[i];
-      if (!el.isConnected) continue;
-      const text = el.innerText.trim();
-      el.setAttribute('data-plamo-origin', 'true');
-
-      // Create placeholder block
-      const inlineEl = document.createElement('div');
-      inlineEl.className = 'plamo-ext-inline-translation';
-      inlineEl.setAttribute('data-plamo-state', 'translating');
-      inlineEl.innerHTML = `
-        <span class="plamo-ext-inline-badge">PLaMo 訳</span>
-        <span class="plamo-ext-inline-content">翻訳中...</span>
-      `;
-      if (el.slot) inlineEl.slot = el.slot;
-      el.parentNode.insertBefore(inlineEl, el.nextSibling);
-
-      try {
-        const response = await chrome.runtime.sendMessage({
-          type: 'TRANSLATE_TEXT',
-          text,
-          targetLang: currentSettings.targetLang || 'ja',
-          form: currentSettings.form || 'none'
-        });
-
-        if (signal.aborted) {
-          removeElement(inlineEl);
-          break;
-        }
-
-        if (response && response.ok) {
-          inlineEl.setAttribute('data-plamo-state', 'done');
-          const contentEl = inlineEl.querySelector('.plamo-ext-inline-content');
-          if (contentEl) {
-            contentEl.textContent = response.translatedText;
-          }
-        } else {
-          inlineEl.setAttribute('data-plamo-state', 'error');
-          inlineEl.innerHTML = `
-            <span class="plamo-ext-inline-badge" style="background:#fee2e2;color:#b91c1c;">エラー</span>
-            <span class="plamo-ext-inline-content" style="color:#ef4444;">${escapeHtml(response ? response.error : '応答なし')}</span>
-          `;
-        }
-      } catch (err) {
-        if (signal.aborted) {
-          removeElement(inlineEl);
-          break;
-        }
-        inlineEl.setAttribute('data-plamo-state', 'error');
-        inlineEl.innerHTML = `
-          <span class="plamo-ext-inline-badge" style="background:#fee2e2;color:#b91c1c;">エラー</span>
-          <span class="plamo-ext-inline-content" style="color:#ef4444;">${escapeHtml(err.message || String(err))}</span>
-        `;
+      for (const el of pageQueue) {
+        if (!el.isConnected) pageQueue.delete(el);
       }
 
-      completedCount++;
-      updatePageBar(completedCount, totalCount);
+      if (pageQueue.size === 0) {
+        if (!pageBarIdleShown) {
+          pageBarIdleShown = true;
+          updatePageBar();
+        }
+        await new Promise(r => setTimeout(r, 300));
+        continue;
+      }
+
+      pageBarIdleShown = false;
+      if (!(await translateElement(takeNearestQueued(), signal))) break;
 
       // Short delay between blocks to avoid overloading LM Studio
       await new Promise(r => setTimeout(r, 60));
     }
-
-    if (!signal.aborted) {
-      isPageTranslationActive = false;
-      updatePageBar(completedCount, totalCount, true);
-    }
   }
 
-  function renderPageBar(total) {
+  function renderPageBar() {
     removePageBar();
 
-    const srcLabel = document.body.classList.contains('plamo-ext-hide-original') ? t('btnShowOriginal') : t('btnHideOriginal');
+    const srcLabel = document.body.classList.contains('plamo-ext-show-original') ? t('btnShowTranslation') : t('btnShowOriginal');
     pageBarEl = document.createElement('div');
     pageBarEl.className = 'plamo-ext-page-bar';
     pageBarEl.innerHTML = `
       <span class="plamo-ext-page-title">🌐 PLaMo</span>
-      <span class="plamo-ext-page-progress">${t('pageTranslatingProgress', { current: 0, total })}</span>
+      <span class="plamo-ext-page-progress">${t('pageTranslatingProgress', { current: 0, total: 0 })}</span>
       <button class="plamo-ext-btn-sm plamo-ext-page-toggle-src" title="${srcLabel}">${srcLabel}</button>
       <button class="plamo-ext-btn-sm plamo-ext-page-pause" title="${t('btnPause')}">${t('btnPause')}</button>
       <button class="plamo-ext-btn-sm plamo-ext-page-restore" title="${t('btnRestore')}">${t('btnRestore')}</button>
@@ -673,14 +914,16 @@
     const restoreBtn = pageBarEl.querySelector('.plamo-ext-page-restore');
 
     toggleSrcBtn.addEventListener('click', () => {
-      document.body.classList.toggle('plamo-ext-hide-original');
-      const isHidden = document.body.classList.contains('plamo-ext-hide-original');
-      toggleSrcBtn.textContent = isHidden ? t('btnShowOriginal') : t('btnHideOriginal');
+      document.body.classList.toggle('plamo-ext-show-original');
+      const showingOriginal = document.body.classList.contains('plamo-ext-show-original');
+      toggleSrcBtn.textContent = showingOriginal ? t('btnShowTranslation') : t('btnShowOriginal');
+      toggleSrcBtn.title = toggleSrcBtn.textContent;
+      hideTooltip();
     });
 
     pauseBtn.addEventListener('click', () => {
       isPageTranslationPaused = !isPageTranslationPaused;
-      pauseBtn.textContent = isPageTranslationPaused ? t('btnResume') : t('btnPause');
+      updatePageBar();
     });
 
     restoreBtn.addEventListener('click', () => {
@@ -690,22 +933,26 @@
     document.body.appendChild(pageBarEl);
   }
 
-  function updatePageBar(current = 0, total = 0, isFinished = false) {
+  function updatePageBar() {
     if (!pageBarEl) return;
-    const progressEl = pageBarEl.querySelector('.plamo-ext-page-progress');
     const pauseBtn = pageBarEl.querySelector('.plamo-ext-page-pause');
-
-    if (progressEl) {
-      if (isFinished) {
-        progressEl.textContent = t('pageTranslationComplete', { total });
-      } else {
-        progressEl.textContent = t('pageTranslatingProgress', { current, total });
-      }
+    pauseBtn.textContent = isPageTranslationPaused ? t('btnResume') : t('btnPause');
+    pauseBtn.title = pauseBtn.textContent;
+    const progressEl = pageBarEl.querySelector('.plamo-ext-page-progress');
+    if (isPageTranslationPaused) {
+      progressEl.textContent = t('pageTranslationPaused');
+    } else if (pageBarIdleShown) {
+      progressEl.textContent = t('pageTranslationIdle', { total: pageDoneCount });
+    } else {
+      progressEl.textContent = t('pageTranslatingProgress', { current: pageDoneCount, total: pageDoneCount + pageQueue.size });
     }
+  }
 
-    if (pauseBtn && isFinished) {
-      pauseBtn.style.display = 'none';
-    }
+  function showPageBarError(message) {
+    const progressEl = pageBarEl && pageBarEl.querySelector('.plamo-ext-page-progress');
+    if (progressEl) progressEl.textContent = t('pageTranslationError', { message });
+    // 待機表示への切り替えでエラー表示を上書きしない
+    pageBarIdleShown = true;
   }
 
   function removePageBar() {
@@ -722,16 +969,17 @@
       pageTranslationAbortController.abort();
       pageTranslationAbortController = null;
     }
+    if (pageIntersectionObserver) pageIntersectionObserver.disconnect();
+    pageIntersectionObserver = null;
+    if (pageMutationObserver) pageMutationObserver.disconnect();
+    pageMutationObserver = null;
+    clearTimeout(pageRescanTimer);
+    pageQueue.clear();
 
-    document.body.classList.remove('plamo-ext-hide-original');
-
-    // Remove all injected inline blocks
-    const inlines = document.querySelectorAll('.plamo-ext-inline-translation');
-    inlines.forEach(el => removeElement(el));
-
-    // Remove origin markers
-    const origins = document.querySelectorAll('[data-plamo-origin="true"]');
-    origins.forEach(el => el.removeAttribute('data-plamo-origin'));
+    document.body.classList.remove('plamo-ext-show-original');
+    document.querySelectorAll('.plamo-ext-replaced').forEach(removeElement);
+    document.querySelectorAll('[data-plamo-origin]').forEach(el => el.removeAttribute('data-plamo-origin'));
+    removeTooltip();
 
     removePageBar();
   }
