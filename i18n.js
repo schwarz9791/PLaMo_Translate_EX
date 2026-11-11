@@ -14,6 +14,7 @@
       statusDisconnected: '未接続',
       statusConnected: '接続中',
       btnOpenTab: 'タブで全画面表示',
+      btnOpenSidePanel: 'サイドパネルで開く',
       btnToggleSettings: '設定を開く',
       btnCloseSettings: '設定を閉じる',
 
@@ -134,12 +135,13 @@
 
       // Whole-Page Translation Bar
       pageTranslatingProgress: 'PLaMo ページ翻訳中... ({current}/{total})',
-      pageTranslationComplete: 'PLaMo ページ翻訳完了 ({total}件)',
+      pageTranslationError: 'PLaMo 翻訳エラー: {message}',
+      pageTranslationIdle: 'PLaMo 表示範囲の翻訳完了 ({total}件)',
       pageTranslationPaused: 'PLaMo ページ翻訳一時停止中',
       btnPause: '一時停止',
       btnResume: '再開',
-      btnHideOriginal: '原文を隠す',
       btnShowOriginal: '原文を表示',
+      btnShowTranslation: '訳文を表示',
       btnRestore: '元に戻す',
 
       // Context Menus
@@ -154,6 +156,7 @@
       statusDisconnected: 'Disconnected',
       statusConnected: 'Connected',
       btnOpenTab: 'Open in Full Tab',
+      btnOpenSidePanel: 'Open in Side Panel',
       btnToggleSettings: 'Settings',
       btnCloseSettings: 'Close Settings',
 
@@ -274,12 +277,13 @@
 
       // Whole-Page Translation Bar
       pageTranslatingProgress: 'PLaMo Translating Page... ({current}/{total})',
-      pageTranslationComplete: 'PLaMo Page Translation Complete ({total} items)',
+      pageTranslationError: 'PLaMo translation error: {message}',
+      pageTranslationIdle: 'PLaMo Visible Area Translated ({total} items)',
       pageTranslationPaused: 'PLaMo Page Translation Paused',
       btnPause: 'Pause',
       btnResume: 'Resume',
-      btnHideOriginal: 'Hide Original',
       btnShowOriginal: 'Show Original',
+      btnShowTranslation: 'Show Translation',
       btnRestore: 'Restore',
 
       // Context Menus

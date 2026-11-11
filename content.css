@@ -6,8 +6,7 @@
 /* Root / Shared Reset for Injected Elements */
 .plamo-ext-floating-trigger,
 .plamo-ext-popover-card,
-.plamo-ext-page-bar,
-.plamo-ext-inline-translation {
+.plamo-ext-page-bar {
   all: initial;
   box-sizing: border-box;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Hiragino Sans", "Meiryo", sans-serif;
@@ -19,8 +18,7 @@
 
 .plamo-ext-floating-trigger *,
 .plamo-ext-popover-card *,
-.plamo-ext-page-bar *,
-.plamo-ext-inline-translation * {
+.plamo-ext-page-bar * {
   box-sizing: border-box;
   font-family: inherit;
 }
@@ -445,59 +443,28 @@
   border-color: #10b981 !important;
 }
 
-/* 3. Whole-Page Inline Translation Blocks */
-.plamo-ext-inline-translation {
-  display: block;
-  margin: 6px 0 10px 0;
-  padding: 8px 12px 8px 14px;
-  background: #f0f7ff;
-  border-left: 3px solid #2563eb;
-  border-radius: 0 6px 6px 0;
-  color: #1e3a8a;
-  font-size: 0.95em;
-  line-height: 1.6;
-  position: relative;
-  transition: opacity 0.2s ease;
-  animation: plamo-fade-in 0.2s ease-out;
-}
-
-@media (prefers-color-scheme: dark) {
-  .plamo-ext-inline-translation {
-    background: #172554;
-    border-left-color: #3b82f6;
-    color: #dbeafe;
-  }
-}
-
-.plamo-ext-inline-translation[data-plamo-state="translating"] {
-  opacity: 0.7;
-  font-style: italic;
-  color: #64748b;
-}
-
-.plamo-ext-inline-badge {
-  display: inline-block;
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  color: #2563eb;
-  background: #dbeafe;
-  padding: 1px 5px;
-  border-radius: 3px;
-  margin-right: 6px;
-  vertical-align: middle;
-}
-
-@media (prefers-color-scheme: dark) {
-  .plamo-ext-inline-badge {
-    background: #1e3a8a;
-    color: #93c5fd;
-  }
-}
-
-/* Mode to hide or dim original text during page translation */
-body.plamo-ext-hide-original [data-plamo-origin="true"] {
+/* 3. Whole-Page Translation (replace in place) */
+body:not(.plamo-ext-show-original) [data-plamo-origin="done"] {
   display: none !important;
+}
+
+body.plamo-ext-show-original .plamo-ext-replaced {
+  display: none !important;
+}
+
+/* 訳文中の改行を表示する（折り返しは継承のまま） */
+.plamo-ext-replaced {
+  white-space-collapse: preserve-breaks;
+}
+
+[data-plamo-origin="translating"] {
+  box-shadow: inset 0 0 0 9999px rgba(37, 99, 235, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  [data-plamo-origin="translating"] {
+    box-shadow: inset 0 0 0 9999px rgba(96, 165, 250, 0.16);
+  }
 }
 
 /* 4. Whole-Page Translation Floating Status Bar */
