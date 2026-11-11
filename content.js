@@ -25,6 +25,10 @@
   let pageMutationObserver = null;
   let pageRescanTimer = null;
   let pageDoneCount = 0;
+  let pageFailStreak = 0;
+  const PAGE_FAIL_PAUSE_THRESHOLD = 3;
+  const RETRANSLATE_INTERVAL_MS = 10000;
+  let lastTranslatedAt = new WeakMap();
   let pageBarIdleShown = false;
   let pageBarError = null;
   // 原文要素 → 挿入済みの訳文。原文が差し替わったら訳文を破棄して再翻訳するために保持する
@@ -487,8 +491,8 @@
         return false;
       }
 
-      // 操作部品を含む要素は置換すると機能を失うため対象外
-      if (el.querySelector('button, input, select, textarea, video, audio, iframe, canvas')) {
+      // 操作部品や画像リンクを含む要素は置換すると機能やリンクを失うため対象外
+      if (el.querySelector('button, input, select, textarea, video, audio, iframe, canvas, a[href] img, a[href] svg')) {
         return false;
       }
 
@@ -787,6 +791,7 @@
     isPageTranslationPaused = paused;
     if (!paused) {
       pageBarError = null;
+      pageFailStreak = 0;
       document.querySelectorAll('[data-plamo-origin="error"]').forEach(el => el.removeAttribute('data-plamo-origin'));
       watchNewCandidates();
     }
@@ -796,17 +801,37 @@
   // 原文が消えた・書き換わった、または訳文が除去された組は破棄し、再走査で再翻訳させる
   function syncTranslated() {
     for (const [el, { shell, source }] of pageTranslated) {
-      if (el.isConnected && shell.isConnected && el.textContent === source) continue;
+      if (el.isConnected && shell.isConnected && el.textContent === source) {
+        if (el.nextSibling !== shell) el.after(shell);
+        continue;
+      }
       pageTranslated.delete(el);
       shell.remove();
       if (el.isConnected) el.removeAttribute('data-plamo-origin');
     }
   }
 
+  function scheduleRescan() {
+    if (pageRescanTimer) return;
+    pageRescanTimer = setTimeout(() => {
+      pageRescanTimer = null;
+      syncTranslated();
+      watchNewCandidates();
+    }, 800);
+  }
+
   function watchNewCandidates(candidates = findTranslatableElements()) {
     for (const el of candidates) {
       el.setAttribute('data-plamo-origin', 'pending');
-      pageIntersectionObserver.observe(el);
+      // 更新され続ける要素が LLM 呼び出しとちらつきを連発しないよう、前回の翻訳から間隔を空ける（待機中は原文を表示）
+      const wait = (lastTranslatedAt.get(el) || 0) + RETRANSLATE_INTERVAL_MS - Date.now();
+      if (wait > 0) {
+        setTimeout(() => {
+          if (pageIntersectionObserver && el.getAttribute('data-plamo-origin') === 'pending') pageIntersectionObserver.observe(el);
+        }, wait);
+      } else {
+        pageIntersectionObserver.observe(el);
+      }
     }
   }
 
@@ -833,12 +858,9 @@
     el.setAttribute('data-plamo-origin', 'translating');
 
     let failure = null;
-    // 通信・バックエンド障害のときだけ全体を一時停止し、再開時にまとめて再試行させる（要素固有の失敗では止めない）
-    let pauseOnFailure = false;
     try {
       const source = el.textContent;
       const { text, parts, links } = buildSource(el);
-      pauseOnFailure = true;
       const response = await chrome.runtime.sendMessage({
         type: 'TRANSLATE_TEXT',
         text,
@@ -851,15 +873,20 @@
       if (!response || !response.ok) {
         failure = response ? response.error : '応答なし';
       } else {
-        pauseOnFailure = false;
         if (!response.translatedText || !response.translatedText.trim()) {
           failure = '翻訳結果が空です';
+        } else if (!el.isConnected || el.textContent !== source) {
+          // 翻訳中に原文が書き換わった訳は古いので挿入せず、再走査で訳し直す
+          el.removeAttribute('data-plamo-origin');
+          if (el.isConnected) scheduleRescan();
+          return true;
         } else {
           const lang = response.effectiveTargetLang || currentSettings.targetLang || 'ja';
           const shell = createShell(el, lang === 'ja-easy' ? 'ja' : lang);
           shell.appendChild(buildTranslation(response.translatedText, links));
           replacedParts.set(shell, parts);
           el.after(shell);
+          lastTranslatedAt.set(el, Date.now());
           pageTranslated.set(el, { shell, source });
           el.setAttribute('data-plamo-origin', 'done');
         }
@@ -872,9 +899,11 @@
     if (failure !== null) {
       el.setAttribute('data-plamo-origin', 'error');
       console.warn('[PLaMo] page translation failed:', failure);
-      if (pauseOnFailure) isPageTranslationPaused = true;
+      // 障害は連続する失敗として現れるため、その時だけ一時停止する（1要素の失敗では止めない）
+      if (++pageFailStreak >= PAGE_FAIL_PAUSE_THRESHOLD) isPageTranslationPaused = true;
       showPageBarError(failure);
     } else {
+      pageFailStreak = 0;
       pageDoneCount++;
       pageBarError = null;
       updatePageBar();
@@ -898,9 +927,11 @@
     const { signal } = controller;
 
     pageDoneCount = 0;
+    pageFailStreak = 0;
     pageBarIdleShown = false;
     pageBarError = null;
     pageTranslated.clear();
+    lastTranslatedAt = new WeakMap();
     renderPageBar();
 
     pageIntersectionObserver = new IntersectionObserver((entries, observer) => {
@@ -913,16 +944,16 @@
 
     // ponytail: 変化のたびにルート全体を再走査する。重くなれば追加ノードの部分木だけ走査する方式へ。
     // 変化し続けるページでも再走査が止まらないよう間引きで実行する。
-    // 訳文だけが外部から除去された場合も同期させるため、除去は自前ノードでも拾う
+    // 再走査が必要なのは、翻訳済み原文のテキスト変更、外部ノードの追加、翻訳対象や訳文の除去のみ
+    const TRACKED_SELECTOR = '[data-plamo-origin="done"], .plamo-ext-replaced';
     pageMutationObserver = new MutationObserver((records) => {
-      const relevant = records.some(r => !isOwnNode(r.target) &&
-        (r.type === 'characterData' || r.removedNodes.length > 0 || [...r.addedNodes].some(n => !isOwnNode(n))));
-      if (!relevant || pageRescanTimer) return;
-      pageRescanTimer = setTimeout(() => {
-        pageRescanTimer = null;
-        syncTranslated();
-        watchNewCandidates();
-      }, 800);
+      const relevant = records.some(r => {
+        if (r.type === 'characterData') return !!r.target.parentElement?.closest('[data-plamo-origin="done"]');
+        if (isOwnNode(r.target)) return false;
+        return [...r.addedNodes].some(n => !isOwnNode(n)) ||
+          [...r.removedNodes].some(n => n.nodeType === Node.ELEMENT_NODE && (n.matches(TRACKED_SELECTOR) || n.querySelector(TRACKED_SELECTOR)));
+      });
+      if (relevant) scheduleRescan();
     });
     pageMutationObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
 
@@ -1033,6 +1064,7 @@
   function restorePageTranslation() {
     isPageTranslationActive = false;
     isPageTranslationPaused = false;
+    pageFailStreak = 0;
     if (pageTranslationAbortController) {
       pageTranslationAbortController.abort();
       pageTranslationAbortController = null;
