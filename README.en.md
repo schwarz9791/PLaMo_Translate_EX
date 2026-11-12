@@ -94,7 +94,7 @@ Easily selectable directly from the Settings panel:
    * Inside input fields (`<input>`, `<textarea>`, `contenteditable`), click **"✍️ Replace"** to substitute text directly with the translation.
 4. **Smart Article Extractor for Full-Page Translation**:
    * Automatically locates primary content containers (`<article>`, `<main>`, `[role="main"]`, `.markdown-body`).
-   * Eliminates layout noise: automatically skips sidebars, advertisements, headers, footers, navigation menus, social share widgets, and comments.
+   * Eliminates layout noise: automatically skips sidebars, advertisements, headers, footers, navigation menus, and social share widgets.
    * **Link Density Check**: Skips navigation links and indexes where anchor tags exceed 50% of the character count.
    * **Target Language Skip**: Automatically skips paragraphs already in Japanese when translating to Japanese.
    * Injects bilingual inline blocks viewport-first. Includes a floating control pill to **Pause/Resume**, **Hide/Show Original**, or **Restore** the page.
@@ -183,7 +183,7 @@ For translating with heavier models on high-performance GPUs:
 ### 3. Smart Whole-Page Article Translation
 
 - Click **🌐 Translate Whole Page** in the side panel, or right-click anywhere on the page and select **Translate this page with PLaMo Translate**.
-- **Smart Content Extraction**: Automatically focuses on article body content and excludes sidebars, navigation bars, headers, footers, advertisements, and comments.
+- **Smart Content Extraction**: Automatically focuses on article body content and excludes sidebars, navigation bars, headers, footers, and advertisements.
 - Bilingual translation blocks appear beneath each paragraph viewport-first.
 - Use the bottom-right floating control pill to **Hide/Show Original**, **Pause/Resume**, or **Restore** the page.
 
