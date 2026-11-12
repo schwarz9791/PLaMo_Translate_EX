@@ -539,6 +539,7 @@
   const replacedParts = new WeakMap();
 
   const collapseSpaces = (str) => str.replace(/\s+/g, ' ');
+  const collapseSpacesKeepBreaks = (str) => str.replace(/[^\S\n]+/g, ' ').replace(/ ?\n ?/g, '\n');
   const escapeMarkup = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const unescapeMarkup = (str) => str
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
@@ -557,12 +558,12 @@
       const keepNewlines = style.whiteSpaceCollapse !== 'collapse';
       for (const child of node.childNodes) {
         if (child.nodeType === Node.TEXT_NODE) {
-          parts.push({ text: keepNewlines ? child.nodeValue.replace(/[^\S\n]+/g, ' ').replace(/ ?\n ?/g, '\n') : collapseSpaces(child.nodeValue) });
+          parts.push({ text: keepNewlines ? collapseSpacesKeepBreaks(child.nodeValue) : collapseSpaces(child.nodeValue) });
         } else if (child.nodeType === Node.ELEMENT_NODE) {
           // display: contents は checkVisibility() が false になるが中身は表示される
           const childStyle = getComputedStyle(child);
           const display = childStyle.display;
-          if (display !== 'contents' && !child.checkVisibility()) continue;
+          if (display !== 'contents' && !child.checkVisibility({ visibilityProperty: true })) continue;
           if (child.tagName === 'BR') {
             parts.push({ text: '\n' });
             continue;
@@ -603,12 +604,12 @@
     const parts = extractParts(el);
     const links = parts.filter(p => p.link).map(p => p.link);
     if (links.length === 0) {
-      return { text: parts.map(p => p.text).join(''), parts, links };
+      return { text: collapseSpacesKeepBreaks(parts.map(p => p.text).join('')), parts, links };
     }
     let n = 0;
-    const text = parts.map(p => p.link
+    const text = collapseSpacesKeepBreaks(parts.map(p => p.link
       ? `<a href="${++n}">${escapeMarkup(p.text)}</a>`
-      : escapeMarkup(p.text)).join('');
+      : escapeMarkup(p.text)).join(''));
     return { text, parts, links };
   }
 
