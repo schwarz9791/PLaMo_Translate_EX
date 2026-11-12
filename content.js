@@ -431,7 +431,7 @@
 
   function findTranslatableElements() {
     const root = findMainContentRoot();
-    const selector = 'p, h1, h2, h3, h4, h5, h6, li, blockquote, td, figcaption, [slot="title"]';
+    const selector = 'p, h1, h2, h3, h4, h5, h6, li, blockquote, td, figcaption, [slot="title"], #content-text';
     const all = Array.from(root.querySelectorAll(selector));
 
     const targetLang = currentSettings.targetLang || 'ja';
@@ -455,9 +455,6 @@
       '[aria-hidden="true"]',
       '.sidebar',
       '#sidebar',
-      '.comments',
-      '#comments',
-      '.comment-list',
       '.ad',
       '.advertisement',
       '.ad-container',
@@ -554,9 +551,11 @@
       if (last && last.text !== '\n') parts.push({ text: '\n' });
     };
     const walk = (node) => {
+      // pre-wrap / pre-line の要素では改行が意味を持つため残す
+      const keepNewlines = getComputedStyle(node).whiteSpaceCollapse !== 'collapse';
       for (const child of node.childNodes) {
         if (child.nodeType === Node.TEXT_NODE) {
-          parts.push({ text: collapseSpaces(child.nodeValue) });
+          parts.push({ text: keepNewlines ? child.nodeValue.replace(/[^\S\n]+/g, ' ') : collapseSpaces(child.nodeValue) });
         } else if (child.nodeType === Node.ELEMENT_NODE) {
           // display: contents は checkVisibility() が false になるが中身は表示される
           const display = getComputedStyle(child).display;
@@ -659,7 +658,10 @@
   }
 
   function createShell(el, lang) {
-    const shell = el.localName.includes('-') ? document.createElement('div') : el.cloneNode(false);
+    const isCustom = el.localName.includes('-');
+    const shell = isCustom ? document.createElement('div') : el.cloneNode(false);
+    // カスタム要素向けのスタイルは素の div に当たらないため、文字の見た目だけ引き継ぐ
+    if (isCustom) shell.style.font = getComputedStyle(el).font;
     shell.removeAttribute('id');
     shell.removeAttribute('data-plamo-origin');
     if (el.slot) shell.slot = el.slot;
