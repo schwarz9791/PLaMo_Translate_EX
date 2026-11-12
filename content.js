@@ -431,7 +431,7 @@
 
   function findTranslatableElements() {
     const root = findMainContentRoot();
-    const selector = 'p, h1, h2, h3, h4, h5, h6, li, blockquote, td, figcaption, [slot="title"], #content-text';
+    const selector = 'p, h1, h2, h3, h4, h5, h6, li, blockquote, td, figcaption, [slot="title"], yt-attributed-string#content-text';
     const all = Array.from(root.querySelectorAll(selector));
 
     const targetLang = currentSettings.targetLang || 'ja';
@@ -488,6 +488,9 @@
         return false;
       }
 
+      // ponytail: 他の翻訳対象ブロックを含む要素は入れ物なので訳さない（<li>親テキスト<ul>…</ul></li> の親側テキストも訳されない。必要なら直下テキストのみ訳す方式へ）
+      if (el.querySelector(selector)) return false;
+
       // 操作部品や画像だけのリンクを含む要素は置換すると機能やリンクを失うため対象外
       if (el.querySelector('button, input, select, textarea, video, audio, iframe, canvas') ||
         [...el.querySelectorAll('a[href]')].some(a => !(a.innerText || '').trim() && a.querySelector('img, svg'))) {
@@ -527,8 +530,7 @@
       return true;
     });
 
-    // ponytail: 末端のみ訳すため <li>親テキスト<ul>…</ul></li> の親側テキストは訳されない。必要なら直下テキストのみ訳す方式へ。
-    return kept.filter((el, i) => !(kept[i + 1] && el.contains(kept[i + 1])));
+    return kept;
   }
 
   // -------------------------------------------------------------
@@ -550,18 +552,24 @@
       const last = parts[parts.length - 1];
       if (last && last.text !== '\n') parts.push({ text: '\n' });
     };
-    const walk = (node) => {
-      // pre-wrap / pre-line の要素では改行が意味を持つため残す
-      const keepNewlines = getComputedStyle(node).whiteSpaceCollapse !== 'collapse';
+    const walk = (node, style = getComputedStyle(node)) => {
+      // 改行が表示に効く要素では残す
+      const keepNewlines = style.whiteSpaceCollapse !== 'collapse';
       for (const child of node.childNodes) {
         if (child.nodeType === Node.TEXT_NODE) {
-          parts.push({ text: keepNewlines ? child.nodeValue.replace(/[^\S\n]+/g, ' ') : collapseSpaces(child.nodeValue) });
+          parts.push({ text: keepNewlines ? child.nodeValue.replace(/[^\S\n]+/g, ' ').replace(/ ?\n ?/g, '\n') : collapseSpaces(child.nodeValue) });
         } else if (child.nodeType === Node.ELEMENT_NODE) {
           // display: contents は checkVisibility() が false になるが中身は表示される
-          const display = getComputedStyle(child).display;
+          const childStyle = getComputedStyle(child);
+          const display = childStyle.display;
           if (display !== 'contents' && !child.checkVisibility()) continue;
           if (child.tagName === 'BR') {
             parts.push({ text: '\n' });
+            continue;
+          }
+          // 絵文字を画像で描画するサイトがあり、落とすと訳文への差し替えで消えるため代替テキストを残す
+          if (child.tagName === 'IMG' && child.alt) {
+            parts.push({ text: collapseSpaces(child.alt) });
             continue;
           }
           const isBlock = /^(block|flex|grid|list-item|table|flow-root)/.test(display);
@@ -569,7 +577,7 @@
           if (allowLinks && child instanceof HTMLAnchorElement && child.hasAttribute('href') && child.innerText.trim()) {
             parts.push({ link: child, text: collapseSpaces(child.innerText) });
           } else {
-            walk(child);
+            walk(child, childStyle);
           }
           if (isBlock) breakLine();
         }
@@ -595,7 +603,7 @@
     const parts = extractParts(el);
     const links = parts.filter(p => p.link).map(p => p.link);
     if (links.length === 0) {
-      return { text: el.innerText.trim(), parts, links };
+      return { text: parts.map(p => p.text).join(''), parts, links };
     }
     let n = 0;
     const text = parts.map(p => p.link
@@ -661,7 +669,10 @@
     const isCustom = el.localName.includes('-');
     const shell = isCustom ? document.createElement('div') : el.cloneNode(false);
     // カスタム要素向けのスタイルは素の div に当たらないため、文字の見た目だけ引き継ぐ
-    if (isCustom) shell.style.font = getComputedStyle(el).font;
+    if (isCustom) {
+      const style = getComputedStyle(el);
+      for (const prop of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight']) shell.style[prop] = style[prop];
+    }
     shell.removeAttribute('id');
     shell.removeAttribute('data-plamo-origin');
     if (el.slot) shell.slot = el.slot;
